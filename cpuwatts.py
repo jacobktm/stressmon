@@ -133,3 +133,7 @@ class CPUWatts(HWSensorBase):
         if not self.watts:
             return True
         return False
+
+    def get_count(self):
+        return len(self.watts)
+
