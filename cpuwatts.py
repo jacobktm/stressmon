@@ -6,6 +6,24 @@ from os.path import exists
 from stressmon.hwsensors import HWSensorBase
 
 
+_SHORT_NAMES = {
+    "package-0": "Package",
+    "psys": "Platform",
+    "core": "Cores",
+    "uncore": "Uncore",
+}
+
+
+def _domain_name(domain_index):
+    """Read the RAPL domain name from sysfs, falling back to 'CPU<N>'."""
+    name_file = f"/sys/class/powercap/intel-rapl:{domain_index}/name"
+    try:
+        with open(name_file, encoding='UTF-8') as f:
+            return f.read().strip()
+    except Exception:
+        return f"CPU{domain_index}"
+
+
 class CPUWatts(HWSensorBase):
     """Logging CPU power usage
     """
@@ -13,7 +31,7 @@ class CPUWatts(HWSensorBase):
     headings = ["CPU", "Current(W)", "Min(W)", "Max(W)", "Mean(W)"]
 
     def __init__(self):
-        self.cpu_count = 1
+        self.cpu_count = 0
         self.watts = {}
         self.file_time = {}
         self.cpu_joules = {}
@@ -21,15 +39,14 @@ class CPUWatts(HWSensorBase):
         self.iteration = 1
         self.labels = []
         self._iter = None
-        if not exists('/sys/class/powercap/intel-rapl:0/energy_uj'):
-            self.cpu_count = 0
-            return
-        if exists('/sys/class/powercap/intel-rapl:1/energy_uj'):
-            self.cpu_count = 2
-        for i in range(self.cpu_count):
-            index = f"CPU{i}"
-            self.labels.append(index)
+
+        for i in range(2):
             energy_uj = f"/sys/class/powercap/intel-rapl:{i}/energy_uj"
+            if not exists(energy_uj):
+                continue
+            raw = _domain_name(i)
+            index = _SHORT_NAMES.get(raw, raw)
+            self.labels.append(index)
             with open(energy_uj, 'r', encoding='UTF-8') as joule_file:
                 self.cpu_joules[index] = joule_file.read()
                 self.file_time[index] = time_ns()
@@ -38,6 +55,7 @@ class CPUWatts(HWSensorBase):
             self.mmm['min'][index] = 9999
             self.mmm['max'][index] = 0
             self.mmm['mean'][index] = 0
+            self.cpu_count += 1
 
     def __iter__(self):
         """Make class an iterator."""
@@ -50,10 +68,10 @@ class CPUWatts(HWSensorBase):
     def update(self):
         """Calculate CPU Watts
         """
-        for i in range(self.cpu_count):
-            index = f"CPU{i}"
+        for index in self.labels:
             start_joule = self.cpu_joules[index]
             start_time = self.file_time[index]
+            i = self.labels.index(index)
             energy_uj = f"/sys/class/powercap/intel-rapl:{i}/energy_uj"
             with open(energy_uj, 'r', encoding='UTF-8') as joule_file:
                 self.cpu_joules[index] = joule_file.read()
@@ -80,7 +98,7 @@ class CPUWatts(HWSensorBase):
 
     def get_section(self, _) -> str | None:
         """Get section"""
-        return "CPU Watts"
+        return "CPU Power"
 
     def get_subsection(self, _) -> str | None:
         """Get subsection"""
@@ -91,41 +109,38 @@ class CPUWatts(HWSensorBase):
         """
         if len(params) != 1:
             return None
-        return round(self.watts[params[0]])
+        return round(self.watts.get(params[0], 0))
 
     def get_min(self, params: list) -> int | None:
         """Get minimum value for sensor data
         """
         if len(params) != 1:
             return None
-        return round(self.mmm['min'][params[0]])
+        return round(self.mmm['min'].get(params[0], 0))
 
     def get_max(self, params: list) -> int | None:
         """Get maximum value for sensor data
         """
         if len(params) != 1:
             return None
-        return round(self.mmm['max'][params[0]])
+        return round(self.mmm['max'].get(params[0], 0))
 
     def get_mean(self, params: list) -> int | None:
         """Get average value for sensor data
         """
         if len(params) != 1:
             return None
-        return round(self.mmm['mean'][params[0]])
+        return round(self.mmm['mean'].get(params[0], 0))
 
     def get_csv_headings(self) -> list:
         """Return headings for csv file for sensor
         """
-        ret = []
-        for cpu in self.labels:
-            ret.append(f"{cpu}(Watts)")
-        return ret
+        return [f"{cpu}(Watts)" for cpu in self.labels]
 
     def get_csv_data(self) -> list:
         """Return list of sensor data for sensor
         """
-        return [round(x, 4) for x in self.watts.values()]
+        return [round(self.watts.get(cpu, 0), 4) for cpu in self.labels]
 
     def is_empty(self) -> bool:
         """Is the sensor empty?
