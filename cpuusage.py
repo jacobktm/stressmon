@@ -52,8 +52,8 @@ class CPUUsage(HWSensorBase):
 
     def update(self) -> None:
         """Update CPU usage."""
-        main_cpu_usage = [cpu_percent()]
         per_cpu_usage = cpu_percent(percpu=True)
+        main_cpu_usage = [sum(per_cpu_usage) / len(per_cpu_usage)]
         p_core_usage = []
         e_core_usage = []
         if self.cpuinfo.has_intel_pe_cores():
