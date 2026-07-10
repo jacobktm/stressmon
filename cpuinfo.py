@@ -1,4 +1,7 @@
-"""CPU info class
+"""CPU info singleton
+
+Caches CPU info so that repeated instantiation (by CPUFreq, CPUUsage, etc.)
+is near-free instead of re-detecting the CPU every time.
 """
 
 from psutil import cpu_count
@@ -6,11 +9,21 @@ from cpuinfo import get_cpu_info
 
 
 class CPUInfo:
-    """Class to store CPU Info"""
+    """Class to store CPU Info (singleton — expensive init runs once)."""
 
-    def __init__(self) -> None:
-        self.model = get_cpu_info()['brand_raw']
-        self.vendor = get_cpu_info()['vendor_id_raw']
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            inst = super().__new__(cls)
+            inst._init()
+            cls._instance = inst
+        return cls._instance
+
+    def _init(self) -> None:
+        info = get_cpu_info()
+        self.model = info['brand_raw']
+        self.vendor = info['vendor_id_raw']
         self.cores = cpu_count(logical=False)
         self.threads = cpu_count(logical=True)
         self.intel_pe_cores = False
