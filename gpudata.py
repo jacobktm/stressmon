@@ -1,8 +1,12 @@
 """Module for GPU Data
+
+Supports any number of GPUs, including systems with both an integrated and
+a discrete adapter.  Each GPU is classified as integrated or discrete by
+:mod:`stressmon.gpuhw`, and discrete GPUs always sort first so they take
+precedence in the monitor.
 """
 
-from copy import deepcopy
-from re import findall
+import logging
 from subprocess import run, PIPE, CalledProcessError
 from psutil import sensors_fans
 from pyamdgpuinfo import detect_gpus, get_gpu
@@ -11,8 +15,33 @@ from pynvml import nvmlInit, NVMLError, nvmlDeviceGetCount, nvmlDeviceGetHandleB
     nvmlDeviceGetFanSpeed, nvmlDeviceGetTemperature, NVML_TEMPERATURE_GPU, \
     nvmlDeviceGetPowerUsage, nvmlDeviceGetUtilizationRates,                \
     nvmlSystemGetDriverVersion, nvmlDeviceGetClock, NVML_CLOCK_GRAPHICS,   \
-    NVML_CLOCK_ID_CURRENT, nvmlDeviceGetMemoryInfo
+    NVML_CLOCK_ID_CURRENT, nvmlDeviceGetMemoryInfo, nvmlDeviceGetPciInfo, \
+    nvmlDeviceGetPowerManagementLimitConstraints
+from stressmon import gpuhw
 from stressmon.hwsensors import HWSensorBase
+
+log = logging.getLogger(__name__)
+
+KIND_LABELS = {
+    'discrete': 'dGPU',
+    'integrated': 'iGPU',
+    'virtual': 'vGPU',
+    'unknown': 'GPU',
+}
+
+
+def _nvml_name(handle):
+    try:
+        return nvmlDeviceGetName(handle)
+    except NVMLError:
+        return None
+
+
+def _nvml_driver_version():
+    try:
+        return nvmlSystemGetDriverVersion()
+    except NVMLError:
+        return None
 
 
 class GPUData(HWSensorBase):
@@ -31,6 +60,7 @@ class GPUData(HWSensorBase):
     """
 
     headings = ['Data', 'Current', 'Min', 'Max', 'Mean']
+    VENDOR_ORDER = ['nvidia', 'amdgpu', 'intel', 'other']
 
     def __init__(self) -> None:
         self.vendor_iter = None
@@ -40,151 +70,189 @@ class GPUData(HWSensorBase):
         self.current_name = None
         self.vendors = []
         self.gpus = {}
+        self.hw_list = []          # every adapter found, discrete first
+        self.kind = {}             # (vendor, name) -> 'discrete'/'integrated'/...
+        self.fan_units = {}        # (vendor, name) -> '%' (nvidia) or 'RPM'
+        self.slot = {}             # (vendor, name) -> PCI slot
+        self.mem_limits = {}       # (vendor, name) -> dedicated VRAM in GB
+        self.intel_cards = {}      # name -> sysfs card node for the iGPU
+        self.handle_by_name = {}   # name -> NVML handle
+        self.gpuinfo_by_name = {}  # name -> pyamdgpuinfo object
         self.iteration = 1
         self.data = ['temp', 'clock', 'fan_speed', 'power', 'memory', 'utilization']
-        handles = []
-        gpuinfos = []
         self.lines = 1
-        nvidia_gpu_count = 0
-        amd_gpu_count = detect_gpus()
+
+        # Enumerate every display adapter (both iGPU and dGPU) and classify it.
+        try:
+            self.hw_list = gpuhw.discover()
+        except Exception as e:  # never let discovery break monitoring
+            log.debug("GPU discovery failed: %s", e)
+            self.hw_list = []
+
+        nvml_handles = self._init_nvidia()
+        amd_gpus = self._init_amdgpu()
+        self._init_intel()
+
+        # min/max/mean accumulators: built explicitly rather than deep-copied,
+        # since NVML handles and pyamdgpuinfo objects are not copyable.
+        self.mmm = {}
+        for vendor in self.vendors:
+            self.mmm[vendor] = {'names': list(self.gpus[vendor]['names'])}
+            for name in self.mmm[vendor]['names']:
+                self.mmm[vendor][name] = {d: [999999, 0, 0] for d in self.data}
+        self._order_gpus()
+
+    # ── setup helpers ──────────────────────────────────────────────
+
+    def _hw_by_slot(self, slot):
+        for gpu in self.hw_list:
+            if gpu.get("slot") == slot:
+                return gpu
+        return {}
+
+    def _hw_for_vendor(self, vendor_key):
+        return [g for g in self.hw_list if g.get("vendor_key") == vendor_key]
+
+    def _register(self, vendor, name, kind, fan_unit=None, slot="", mem_limit=None):
+        """Create the per-GPU record and remember its classification."""
+        self.gpus[vendor][name] = {
+            'temp': None, 'clock': None, 'fan_speed': None, 'power': None,
+            'power_limit': None, 'memory': None, 'mem_limit': mem_limit,
+            'utilization': None, 'subsysven': None,
+        }
+        self.kind[(vendor, name)] = kind or 'unknown'
+        self.fan_units[(vendor, name)] = fan_unit or 'RPM'
+        self.slot[(vendor, name)] = slot
+        self.mem_limits[(vendor, name)] = mem_limit
+        self.gpus[vendor]['names'].append(name)
+
+    def _init_nvidia(self):
+        """Attach NVML telemetry, matching handles to discovered adapters."""
         try:
             nvmlInit()
-            self.vendors.append('nvidia')
-            nvidia_gpu_count = nvmlDeviceGetCount()
-
-            command = r'lspci -vvnn | grep -A 3 "\[0300\]" | grep -A 3 NVIDIA'
-            nvidia_gpu_data = run([command], shell=True, check=True, stdout=PIPE, stderr=PIPE)
-            nvidia_gpu_data = nvidia_gpu_data.stdout
-            nvidia_gpu_data = nvidia_gpu_data.decode('utf-8').split("\n--\n")
-            pattern = r"\[(\w{4}:\w{4})\]"
-            nvidia_subvens = []
-            for nvidia_gpu in nvidia_gpu_data:
-                result = findall(pattern=pattern, string=nvidia_gpu)
-                if len(result) > 1:
-                    nvidia_subvens.append(result[1].split(":")[0])
-                else:
-                    nvidia_subvens.append(None)
-
-            self.lines += 1
         except NVMLError:
-            pass
-        if amd_gpu_count > 0:
-            command = r'lspci -vvnn | grep -A 3 "\[0300\]" | grep -A 3 AMD'
-            amd_gpu_data = run([command], shell=True, check=True, stdout=PIPE, stderr=PIPE)
-            amd_gpu_data = amd_gpu_data.stdout
-            amd_gpu_data = amd_gpu_data.decode('utf-8').split("\n--\n")
-            pattern = r"\[(\w{4}:\w{4})\]"
-            amd_devs = []
-            amd_subvens = []
-            for amd_gpu in amd_gpu_data:
-                result = findall(pattern=pattern, string=amd_gpu)
-                amd_devs.append(result[0].split(":")[1])
-                if len(result) > 1:
-                    amd_subvens.append(result[1].split(":")[0])
-                else:
-                    amd_subvens.append(None)
+            return []
+        handles = []
+        drivers = [g for g in self._hw_for_vendor('nvidia')]
+        self.vendors.append('nvidia')
+        self.gpus['nvidia'] = {'names': [], 'handles': []}
+        self.gpus['nvidia']['driver_version'] = _nvml_driver_version()
+        self.lines += 1
+        for index in range(nvmlDeviceGetCount()):
+            handle = nvmlDeviceGetHandleByIndex(index)
+            handles.append(handle)
+            nvml_name = _nvml_name(handle)
+            slot = ''
+            try:
+                slot = nvmlDeviceGetPciInfo(handle).busId.lower()
+            except NVMLError:
+                pass
+            hw = self._hw_by_slot(slot) if slot else {}
+            # Fall back to positional matching when the bus id is unavailable.
+            if not hw and index < len(drivers):
+                hw = drivers[index]
+            name = f"{nvml_name or hw.get('name', 'NVIDIA GPU')}-{index}"
+            power_limit = None
+            try:
+                power_limit = nvmlDeviceGetPowerManagementLimit(handle) / 1000
+            except NVMLError:
+                # Laptops often report no enforced limit; fall back to the
+                # board's maximum so the inventory still shows a TDP figure.
+                try:
+                    _min_w, max_w = nvmlDeviceGetPowerManagementLimitConstraints(handle)
+                    power_limit = max_w / 1000 or None
+                except NVMLError:
+                    power_limit = None
+            try:
+                mem_mb = nvmlDeviceGetMemoryInfo(handle).total / 1024 / 1024
+            except NVMLError:
+                mem_mb = None
+            # NVIDIA is always discrete; its "fan speed" is a duty-cycle %.
+            self._register('nvidia', name, 'discrete', fan_unit='%',
+                           slot=hw.get('slot', slot), mem_limit=mem_mb)
+            self.handle_by_name[name] = handle
+            self.gpus['nvidia'][name]['power_limit'] = power_limit
+            self.gpus['nvidia'][name]['subsysven'] = hw.get('subsystem') or None
+            self.lines += 8
+        self.gpus['nvidia']['handles'] = handles
+        return handles
 
-            self.vendors.append('amdgpu')
-            self.lines += 1
-        if self.vendors:
-            self.gpus = dict.fromkeys(self.vendors)
-            if 'nvidia' in self.vendors:
-                self.gpus['nvidia'] = {}
-                self.gpus['nvidia']['handles'] = []
-                self.gpus['nvidia']['names'] = []
-                self.lines += nvidia_gpu_count * 2
-                for i in range(nvidia_gpu_count):
-                    handle = nvmlDeviceGetHandleByIndex(i)
-                    name = f"{nvmlDeviceGetName(handle)}-{i}"
-                    try:
-                        power_limit = nvmlDeviceGetPowerManagementLimit(
-                            handle) / 1000
-                    except NVMLError:
-                        power_limit = None
-                    handles.append(handle)
-                    subven = str(nvidia_subvens[i])
-                    if subven:
-                        command = f"cat venids | grep -i \"{subven},\""
-                        try:
-                            output = run([command],
-                                         shell=True,
-                                         check=True,
-                                         stdout=PIPE,
-                                         stderr=PIPE).stdout.decode('utf-8')
-                            subven = output[5:]
-                        except CalledProcessError:
-                            pass
+    def _init_amdgpu(self):
+        """Attach pyamdgpuinfo telemetry for every AMD adapter."""
+        try:
+            amd_count = detect_gpus()
+        except Exception:
+            amd_count = 0
+        if not amd_count:
+            return []
+        self.vendors.append('amdgpu')
+        self.gpus['amdgpu'] = {'names': [], 'gpuinfos': []}
+        self.lines += 1
+        adapters = self._hw_for_vendor('amdgpu')
+        for index in range(amd_count):
+            try:
+                gpuinfo = get_gpu(index)
+            except Exception:
+                continue
+            hw = adapters[index] if index < len(adapters) else {}
+            display = gpuinfo.name or hw.get('name') or f"AMD GPU {index}"
+            name = f"{display}-{index}"
+            try:
+                vram_mb = round(gpuinfo.memory_info['vram_size'] / 1024 / 1024, 2)
+            except Exception:
+                vram_mb = None
+            kind = gpuhw.classify(0x1002, display, vram_mb)
+            self._register('amdgpu', name, kind, fan_unit='RPM',
+                           slot=hw.get('slot', ''), mem_limit=vram_mb)
+            self.gpus['amdgpu'][name]['subsysven'] = hw.get('subsystem') or None
+            self.gpus['amdgpu']['gpuinfos'].append(gpuinfo)
+            self.gpuinfo_by_name[name] = gpuinfo
+            self.lines += 7
+        return self.gpus['amdgpu']['gpuinfos']
 
-                    mem_limit = round((nvmlDeviceGetMemoryInfo(handle).total / 1024 / 1024), 2)
-                    self.gpus['nvidia']['names'].append(name)
-                    self.gpus['nvidia'][name] = {'temp': None, 'clock': None, 'fan_speed': None,
-                                                 'power': None, 'power_limit': power_limit,
-                                                 'memory': None, 'mem_limit': mem_limit,
-                                                 'utilization': None, 'subsysven': subven}
-                    self.lines += 6
-            if 'amdgpu' in self.vendors:
-                self.gpus['amdgpu'] = {}
-                self.gpus['amdgpu']['names'] = []
-                self.gpus['amdgpu']['gpuinfos'] = []
-                self.lines += amd_gpu_count * 2
-                for i in range(amd_gpu_count):
-                    gpuinfo = get_gpu(i)
-                    name = f"Device_{str(amd_devs[i])}-{i}"
-                    if gpuinfo.name:
-                        name = f"{gpuinfo.name}-{i}"
-                    else:
-                        command = f"cat amddevids | grep -i \"{amd_devs[i]},\""
-                        try:
-                            output = run([command],
-                                         shell=True,
-                                         check=True,
-                                         stdout=PIPE,
-                                         stderr=PIPE).stdout.decode('utf-8')
-                            output = output.replace("\n", "")
-                            name = f"{output[5:]}-{i}"
-                        except CalledProcessError:
-                            pass
+    def _init_intel(self):
+        """Expose Intel iGPUs through the i915 sysfs frequency nodes."""
+        adapters = self._hw_for_vendor('intel')
+        if not adapters:
+            return
+        self.vendors.append('intel')
+        self.gpus['intel'] = {'names': [], 'cards': []}
+        self.lines += 1
+        for index, hw in enumerate(adapters):
+            display = hw.get('name') or f"Intel GPU {index}"
+            name = f"{display}-{index}"
+            self._register('intel', name, 'integrated', fan_unit='RPM',
+                           slot=hw.get('slot', ''))
+            self.gpus['intel'][name]['subsysven'] = hw.get('subsystem') or None
+            self.gpus['intel']['cards'].append(hw.get('card'))
+            self.intel_cards[name] = hw.get('card')
+            self.lines += 7
 
-                    subven = str(amd_subvens[i])
-                    if subven:
-                        command = f"cat venids | grep -i \"{subven},\""
-                        try:
-                            output = run([command],
-                                         shell=True,
-                                         check=True,
-                                         stdout=PIPE,
-                                         stderr=PIPE).stdout.decode('utf-8')
-                            subven = output[5:]
-                        except CalledProcessError:
-                            pass
-
-                    mem_limit = round((gpuinfo.memory_info['vram_size'] / 1024 / 1024), 2)
-                    gpuinfos.append(gpuinfo)
-                    self.gpus['amdgpu']['names'].append(name)
-                    self.gpus['amdgpu'][name] = {'temp': None, 'clock': None, 'fan_speed': None,
-                                                 'power': None, 'power_limit': None,
-                                                 'memory': None, 'mem_limit': mem_limit,
-                                                 'utilization': None, 'subsysven': subven}
-                    self.lines += 5
-            self.mmm = deepcopy(self.gpus)
-            if handles:
-                self.gpus['nvidia']['handles'] = [handle for handle in handles]
-            if gpuinfos:
-                self.gpus['amdgpu']['gpuinfos'] = [
-                    gpuinfo for gpuinfo in gpuinfos]
-            for vendor in self.vendors:
-                for name in self.mmm[vendor]['names']:
-                    for data in self.data:
-                        self.mmm[vendor][name][data] = [999999, 0, 0]
+    def _order_gpus(self):
+        """Order every vendor's GPU list so discrete GPUs come first."""
+        for vendor in self.vendors:
+            names = self.gpus[vendor].get('names', [])
+            names.sort(key=lambda n: (gpuhw.kind_rank(self.kind.get((vendor, n))),
+                                      self.slot.get((vendor, n), ''), n))
+            self.gpus[vendor]['names'] = names
 
     def __del__(self) -> None:
         if 'nvidia' in self.vendors:
             nvmlShutdown()
 
     def __iter__(self):
-        self.vendor_iter = iter(self.vendors)
+        # Vendors are visited in the order their first GPU ranks, so a
+        # discrete GPU is always presented before an integrated one.
+        self.vendor_iter = iter(self.get_vendor_order())
         self._next_vendor()
         return self
+
+    def get_vendor_order(self) -> list:
+        """Return vendor keys ordered by their best GPU's kind."""
+        return sorted(self.vendors, key=lambda v: (
+            min((gpuhw.kind_rank(self.kind.get((v, n))) for n in
+                 self.gpus.get(v, {}).get('names', [])), default=9),
+            self.VENDOR_ORDER.index(v) if v in self.VENDOR_ORDER else 9))
 
     def _next_vendor(self):
         self.current_vendor = next(self.vendor_iter, None)
@@ -275,12 +343,13 @@ class GPUData(HWSensorBase):
 
         for vendor, gpu_data in self.gpus.items():
             for gpu_name in gpu_data['names']:
-                gpu_index = gpu_data['names'].index(gpu_name)
-
                 if vendor == 'nvidia':
-                    handle = self.gpus[vendor]['handles'][gpu_index]
+                    handle = self.handle_by_name.get(gpu_name)
+                    if handle is None:
+                        continue
                     fan_speed = None
                     try:
+                        # NVML reports fan speed as a duty cycle percentage.
                         fan_speed = nvmlDeviceGetFanSpeed(handle)
                         if self.iteration == 1:
                             self.lines += 1
@@ -302,15 +371,18 @@ class GPUData(HWSensorBase):
                         handle).gpu
 
                 elif vendor == 'amdgpu':
-                    gpuinfo = self.gpus[vendor]['gpuinfos'][gpu_index]
+                    gpuinfo = self.gpuinfo_by_name.get(gpu_name)
+                    if gpuinfo is None:
+                        continue
                     fan_speed = None
                     fans = sensors_fans()
                     if 'amdgpu' in fans.keys():
                         try:
+                            # amdgpu hwmon reports fan speed in RPM.
                             fan_speed = fans['amdgpu'][gpuinfo.gpu_id][1]
                             if self.iteration == 1:
                                 self.lines += 1
-                        except IndexError:
+                        except (IndexError, KeyError, TypeError):
                             pass
 
                     self.gpus[vendor][gpu_name]['temp'] = gpuinfo.query_temperature()
@@ -320,6 +392,17 @@ class GPUData(HWSensorBase):
                         (gpuinfo.query_vram_usage() / 1024 / 1024), 2)
                     self.gpus[vendor][gpu_name]['utilization'] = gpuinfo.query_load(
                     ) * 100
+
+                elif vendor == 'intel':
+                    card = self.intel_cards.get(gpu_name)
+                    telemetry = gpuhw.intel_telemetry(card)
+                    self.gpus[vendor][gpu_name]['clock'] = telemetry.get('clock')
+                    self.gpus[vendor][gpu_name]['power'] = telemetry.get('power_watts')
+                    # Intel iGPUs report no temperature, fan or VRAM data.
+                    self.gpus[vendor][gpu_name]['temp'] = None
+                    self.gpus[vendor][gpu_name]['fan_speed'] = None
+                    self.gpus[vendor][gpu_name]['memory'] = None
+                    self.gpus[vendor][gpu_name]['utilization'] = None
 
                 for data in self.data:
                     current = self.gpus[vendor][gpu_name][data]
@@ -447,6 +530,127 @@ class GPUData(HWSensorBase):
             return ret
         return round(ret)
 
+    # ── multi-GPU helpers ─────────────────────────────────────────
+
+    def get_gpu_kind(self, vendor: str, name: str) -> str:
+        """Return ``'discrete'``/``'integrated'``/``'virtual'`` for a GPU."""
+        return self.kind.get((vendor, name), 'unknown')
+
+    def get_kind_label(self, vendor: str, name: str) -> str:
+        """Return the short label shown in the UI (dGPU/iGPU)."""
+        return KIND_LABELS.get(self.get_gpu_kind(vendor, name), 'GPU')
+
+    def get_fan_unit(self, vendor: str, name: str) -> str:
+        """Return the fan-speed unit for a GPU.
+
+        NVIDIA reports a duty-cycle percentage; amdgpu hwmon reports RPM.
+        """
+        return self.fan_units.get((vendor, name), 'RPM')
+
+    def get_slot(self, vendor: str, name: str) -> str:
+        """Return the PCI slot address for a GPU."""
+        return self.slot.get((vendor, name), '')
+
+    def get_mem_limit(self, vendor: str, name: str) -> float | None:
+        """Return the dedicated VRAM size in MB, if known."""
+        return self.mem_limits.get((vendor, name))
+
+    def get_display_name(self, vendor: str, name: str) -> str:
+        """Return the GPU name without the trailing index suffix."""
+        return name.rsplit('-', 1)[0] if '-' in name else name
+
+    def _build_inventory(self) -> list:
+        """Build the per-GPU entry list, discrete first (no primary flag)."""
+        entries = []
+        for vendor in self.get_vendor_order():
+            vendor_data = self.gpus.get(vendor, {})
+            driver_version = vendor_data.get('driver_version')
+            for name in vendor_data.get('names', []):
+                kind = self.get_gpu_kind(vendor, name)
+                values = {}
+                for metric in self.data:
+                    raw = vendor_data.get(name, {}).get(metric)
+                    values[metric] = round(raw, 4) if isinstance(raw, (int, float)) else None
+                entries.append({
+                    'vendor': vendor,
+                    'name': name,
+                    'display': self.get_display_name(vendor, name),
+                    'kind': kind,
+                    'kind_label': KIND_LABELS.get(kind, 'GPU'),
+                    'slot': self.get_slot(vendor, name),
+                    'fan_unit': self.get_fan_unit(vendor, name),
+                    'vram_mb': self.get_mem_limit(vendor, name),
+                    'power_limit': self.get_power_limit(vendor, name),
+                    'subsysven': self.get_subven(vendor, name),
+                    'driver_version': driver_version,
+                    'monitored': True,
+                    'data': values,
+                })
+        entries.extend(self._unmonitored(entries))
+        return entries
+
+    def _unmonitored(self, entries):
+        """Return discovered adapters that have no live telemetry.
+
+        These are still reported so every GPU the machine has shows up in
+        the monitor and the report, even when no driver exposes readings.
+        """
+        known = {e.get('slot') for e in entries if e.get('slot')}
+        extra = []
+        for hw in self.hw_list:
+            slot = hw.get('slot')
+            if not slot or slot in known:
+                continue
+            kind = hw.get('kind', 'unknown')
+            extra.append({
+                'vendor': hw.get('vendor_key', 'other'),
+                'name': hw.get('name', 'GPU'),
+                'display': hw.get('name', 'GPU'),
+                'kind': kind,
+                'kind_label': KIND_LABELS.get(kind, 'GPU'),
+                'slot': slot,
+                'fan_unit': 'RPM',
+                'vram_mb': None,
+                'power_limit': None,
+                'subsysven': hw.get('subsystem'),
+                'driver_version': None,
+                'monitored': False,
+                'data': {d: None for d in self.data},
+            })
+        return extra
+
+    def get_inventory(self) -> list:
+        """Return every GPU, discrete first, with its classification.
+
+        Each entry: ``vendor``, ``name``, ``display``, ``kind``,
+        ``kind_label``, ``slot``, ``fan_unit``, ``vram_mb``, ``power_limit``,
+        ``subsysven``, ``driver_version``, ``primary`` and ``data`` (the
+        live values keyed by metric name, ``None`` when unsupported).
+        """
+        entries = self._build_inventory()
+        primary = self.get_primary()
+        primary_name = primary['name'] if primary else None
+        for entry in entries:
+            entry['primary'] = (primary_name is not None
+                                and entry['name'] == primary_name)
+        return entries
+
+    def get_primary(self) -> dict | None:
+        """Return the GPU that takes precedence: the first discrete one.
+
+        Falls back to the first GPU present, and to ``None`` when the system
+        has no usable display adapter.
+        """
+        inventory = self._build_inventory()
+        if not inventory:
+            return None
+        # A discrete GPU with live readings wins; otherwise any discrete GPU.
+        for want_monitored in (True, False):
+            for entry in inventory:
+                if entry['kind'] == 'discrete' and entry['monitored'] == want_monitored:
+                    return entry
+        return inventory[0]
+
     def get_csv_data(self) -> list:
         """get a list of current gpu data for csv log
 
@@ -470,9 +674,10 @@ class GPUData(HWSensorBase):
         headings = []
         for vendor in self.vendors:
             for name in self.gpus[vendor]['names']:
+                kind_label = KIND_LABELS.get(self.kind.get((vendor, name)), 'GPU')
                 for data in self.data:
                     if self.gpus[vendor][name][data] is not None:
-                        headings.append(f"{vendor} {name} {data}")
+                        headings.append(f"{vendor} GPU {name} ({kind_label}) {data}")
         return headings
 
     def get_win_lines(self) -> int:
