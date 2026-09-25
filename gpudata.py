@@ -73,6 +73,8 @@ class GPUData(HWSensorBase):
         self.hw_list = []          # every adapter found, discrete first
         self.kind = {}             # (vendor, name) -> 'discrete'/'integrated'/...
         self.fan_units = {}        # (vendor, name) -> '%' (nvidia) or 'RPM'
+        self.fan_sources = {}      # (vendor, name) -> 'driver' or 'acpi'
+        self.fan_labels = {}       # (vendor, name) -> hwmon label of that fan
         self.slot = {}             # (vendor, name) -> PCI slot
         self.mem_limits = {}       # (vendor, name) -> dedicated VRAM in GB
         self.intel_cards = {}      # name -> sysfs card node for the iGPU
@@ -122,9 +124,43 @@ class GPUData(HWSensorBase):
         }
         self.kind[(vendor, name)] = kind or 'unknown'
         self.fan_units[(vendor, name)] = fan_unit or 'RPM'
+        self.fan_sources[(vendor, name)] = None
+        self.fan_labels[(vendor, name)] = None
         self.slot[(vendor, name)] = slot
         self.mem_limits[(vendor, name)] = mem_limit
         self.gpus[vendor]['names'].append(name)
+
+    def _system_fan(self, kind):
+        """Return (label, rpm) for the chassis fan a GPU is cooled by.
+
+        Laptop GPUs frequently have no fan of their own: NVML reports
+        "Not Supported" and the cooling is done by a system fan that the
+        firmware exposes through ACPI/hwmon ("GPU fan").  Those sensors
+        report RPM, never a duty-cycle percentage.
+        """
+        if kind != 'discrete':
+            return None, None
+        wanted = ('gpu', 'dgpu', 'graphics')
+        for chip, entries in sensors_fans().items():
+            for entry in entries:
+                label = (entry.label or '').lower()
+                if any(key in label for key in wanted):
+                    return f"{chip} {entry.label or ''}".strip(), entry.current
+        return None, None
+
+    def _fallback_fan(self, vendor, gpu_name, kind):
+        """Fill a missing GPU fan from the system fan, in RPM."""
+        if self.fan_sources.get((vendor, gpu_name)) == 'driver':
+            return None
+        label, rpm = self._system_fan(kind)
+        if label is None:
+            return None
+        self.fan_units[(vendor, gpu_name)] = 'RPM'
+        self.fan_sources[(vendor, gpu_name)] = 'acpi'
+        self.fan_labels[(vendor, gpu_name)] = label
+        if self.iteration == 1:
+            self.lines += 1
+        return rpm
 
     def _init_nvidia(self):
         """Attach NVML telemetry, matching handles to discovered adapters."""
@@ -355,6 +391,11 @@ class GPUData(HWSensorBase):
                             self.lines += 1
                     except NVMLError:
                         pass
+                    if fan_speed is not None:
+                        self.fan_sources[(vendor, gpu_name)] = 'driver'
+                    else:
+                        fan_speed = self._fallback_fan(
+                            vendor, gpu_name, self.kind.get((vendor, gpu_name)))
 
                     self.gpus[vendor][gpu_name]['temp'] = nvmlDeviceGetTemperature(
                         handle,
@@ -384,6 +425,11 @@ class GPUData(HWSensorBase):
                                 self.lines += 1
                         except (IndexError, KeyError, TypeError):
                             pass
+                    if fan_speed is not None:
+                        self.fan_sources[(vendor, gpu_name)] = 'driver'
+                    else:
+                        fan_speed = self._fallback_fan(
+                            vendor, gpu_name, self.kind.get((vendor, gpu_name)))
 
                     self.gpus[vendor][gpu_name]['temp'] = gpuinfo.query_temperature()
                     self.gpus[vendor][gpu_name]['fan_speed'] = fan_speed
@@ -398,7 +444,8 @@ class GPUData(HWSensorBase):
                     telemetry = gpuhw.intel_telemetry(card)
                     self.gpus[vendor][gpu_name]['clock'] = telemetry.get('clock')
                     self.gpus[vendor][gpu_name]['power'] = telemetry.get('power_watts')
-                    # Intel iGPUs report no temperature, fan or VRAM data.
+                    # Intel iGPUs report no temperature, fan or VRAM data, and
+                    # the chassis fan that cools them is not a GPU fan.
                     self.gpus[vendor][gpu_name]['temp'] = None
                     self.gpus[vendor][gpu_name]['fan_speed'] = None
                     self.gpus[vendor][gpu_name]['memory'] = None
@@ -540,6 +587,15 @@ class GPUData(HWSensorBase):
         """Return the short label shown in the UI (dGPU/iGPU)."""
         return KIND_LABELS.get(self.get_gpu_kind(vendor, name), 'GPU')
 
+    def get_fan_source(self, vendor: str, name: str) -> str | None:
+        """Return 'driver' for a fan the GPU driver reports, 'acpi' when the
+        reading comes from the system fan that cools this GPU, else None."""
+        return self.fan_sources.get((vendor, name))
+
+    def get_fan_label(self, vendor: str, name: str) -> str | None:
+        """Return the hwmon label of the fan backing this GPU's reading."""
+        return self.fan_labels.get((vendor, name))
+
     def get_fan_unit(self, vendor: str, name: str) -> str:
         """Return the fan-speed unit for a GPU.
 
@@ -579,6 +635,8 @@ class GPUData(HWSensorBase):
                     'kind_label': KIND_LABELS.get(kind, 'GPU'),
                     'slot': self.get_slot(vendor, name),
                     'fan_unit': self.get_fan_unit(vendor, name),
+                    'fan_source': self.get_fan_source(vendor, name),
+                    'fan_label': self.get_fan_label(vendor, name),
                     'vram_mb': self.get_mem_limit(vendor, name),
                     'power_limit': self.get_power_limit(vendor, name),
                     'subsysven': self.get_subven(vendor, name),
@@ -610,6 +668,8 @@ class GPUData(HWSensorBase):
                 'kind_label': KIND_LABELS.get(kind, 'GPU'),
                 'slot': slot,
                 'fan_unit': 'RPM',
+                'fan_source': None,
+                'fan_label': None,
                 'vram_mb': None,
                 'power_limit': None,
                 'subsysven': hw.get('subsystem'),
@@ -676,8 +736,15 @@ class GPUData(HWSensorBase):
             for name in self.gpus[vendor]['names']:
                 kind_label = KIND_LABELS.get(self.kind.get((vendor, name)), 'GPU')
                 for data in self.data:
-                    if self.gpus[vendor][name][data] is not None:
-                        headings.append(f"{vendor} GPU {name} ({kind_label}) {data}")
+                    if self.gpus[vendor][name][data] is None:
+                        continue
+                    heading = f"{vendor} GPU {name} ({kind_label}) {data}"
+                    if data == 'fan_speed':
+                        # The unit differs per adapter, so spell it out.
+                        source = self.fan_sources.get((vendor, name))
+                        heading += (f" [{self.fan_units.get((vendor, name), 'RPM')}"
+                                    f"{', system' if source == 'acpi' else ''}]")
+                    headings.append(heading)
         return headings
 
     def get_win_lines(self) -> int:
