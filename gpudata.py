@@ -7,6 +7,7 @@ precedence in the monitor.
 """
 
 import logging
+import threading
 from subprocess import run, PIPE, CalledProcessError
 from psutil import sensors_fans
 from pyamdgpuinfo import detect_gpus, get_gpu
@@ -66,6 +67,41 @@ def _amd(func):
         return None
 
 
+# NVML is initialised once per process, so several GPUData objects in one
+# process have to share it.  The web monitor re-creates a sensor that had
+# nothing to report, which means a discarded object used to call nvmlShutdown()
+# while a live one still held handles from it - every query after that failed
+# with UNINITIALIZED for the rest of the session.
+_nvml_lock = threading.Lock()
+_nvml_users = 0
+
+
+def _nvml_init() -> bool:
+    """Open NVML for one GPUData, returning False if it cannot be opened."""
+    global _nvml_users
+    try:
+        nvmlInit()
+    except NVMLError:
+        return False
+    with _nvml_lock:
+        _nvml_users += 1
+    return True
+
+
+def _nvml_shutdown() -> None:
+    """Release NVML, shutting the library down only for the last user."""
+    global _nvml_users
+    with _nvml_lock:
+        if _nvml_users > 1:
+            _nvml_users -= 1
+            return
+        _nvml_users = 0
+    try:
+        nvmlShutdown()
+    except NVMLError as e:      # already down, or never came up: nothing to do
+        log.debug("nvmlShutdown failed: %s", e)
+
+
 class GPUData(HWSensorBase):
     """Class to manage GPU Data.
 
@@ -90,6 +126,7 @@ class GPUData(HWSensorBase):
         self.data_iter = None
         self.current_vendor = None
         self.current_name = None
+        self._nvml_open = False      # NVML is released only by the last user
         self.vendors = []
         self.gpus = {}
         self.hw_list = []          # every adapter found, discrete first
@@ -186,10 +223,9 @@ class GPUData(HWSensorBase):
 
     def _init_nvidia(self):
         """Attach NVML telemetry, matching handles to discovered adapters."""
-        try:
-            nvmlInit()
-        except NVMLError:
+        if not _nvml_init():
             return []
+        self._nvml_open = True
         handles = []
         drivers = [g for g in self._hw_for_vendor('nvidia')]
         self.vendors.append('nvidia')
@@ -295,8 +331,14 @@ class GPUData(HWSensorBase):
             self.gpus[vendor]['names'] = names
 
     def __del__(self) -> None:
-        if 'nvidia' in self.vendors:
-            nvmlShutdown()
+        """Release NVML when this sensor goes away."""
+        try:
+            if self._nvml_open:
+                self._nvml_open = False
+                _nvml_shutdown()
+        except Exception:  # pylint: disable=broad-except
+            # Interpreter shutdown tears the module down before __del__ runs.
+            pass
 
     def __iter__(self):
         # Vendors are visited in the order their first GPU ranks, so a
