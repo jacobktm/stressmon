@@ -14,7 +14,13 @@ class SysFan(HWSensorBase):
 
     def __init__(self) -> None:
         self.iteration = 1
-        self.drivers = [driver for driver in sensors_fans().keys()
+        try:
+            fans = sensors_fans()
+        except (OSError, PermissionError):
+            # hwmon unreadable: report no fans rather than raising out of the
+            # constructor, which takes the whole monitor down at startup.
+            fans = {}
+        self.drivers = [driver for driver in fans.keys()
                         if driver != 'amdgpu']
         self.fans = {}
         self.mmm = {}
@@ -22,18 +28,18 @@ class SysFan(HWSensorBase):
         if self.drivers:
             self.fans = dict.fromkeys(self.drivers)
             for driver in self.drivers:
-                fans = list(sensors_fans()[driver])
-                fans = [fan[0] for fan in fans]
-                for i, fan in enumerate(fans):
+                fans_here = list(fans[driver])
+                fans_here = [fan[0] for fan in fans_here]
+                for i, fan in enumerate(fans_here):
                     if fan == '':
-                        fans[i] = driver
+                        fans_here[i] = driver
                     self.lines += 1
-                self.fans[driver] = dict.fromkeys(fans)
+                self.fans[driver] = dict.fromkeys(fans_here)
             self.lines += 1
             self.mmm = deepcopy(self.fans)
             for driver in self.drivers:
-                fans = list(self.mmm[driver].keys())
-                for fan in fans:
+                fan_names = list(self.mmm[driver].keys())
+                for fan in fan_names:
                     self.mmm[driver][fan] = [9999, 0, 0]
         self.driver_iter = None
         self.current_driver = None
@@ -93,11 +99,21 @@ class SysFan(HWSensorBase):
         if self.drivers:
             current = sensors_fans()
             for driver in self.drivers:
-                fans = list(current[driver])
-                for fan in fans:
+                # A hwmon driver can disappear mid-run (a drive the fan is
+                # attached to dropping off the bus); KeyError here stopped
+                # every fan from updating for the rest of the run.
+                for fan in current.get(driver, []):
                     fan = list(fan)
                     if fan[0] == '':
                         fan[0] = driver
+                    if fan[0] not in self.mmm.get(driver, {}):
+                        # New fan label this round; the CSV headings are fixed
+                        # at init, so recording it would shift later columns.
+                        continue
+                    if fan[1] is None:
+                        # Sensor answered nothing this round; keep the last
+                        # reading rather than comparing against None.
+                        continue
                     self.fans[driver][fan[0]] = fan[1]
                     self.mmm[driver][fan[0]][0] = min(
                         [self.mmm[driver][fan[0]][0], fan[1]])

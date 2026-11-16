@@ -1,9 +1,12 @@
 """Drive temp sensor monitor class
 """
 
+import logging
 from copy import deepcopy
 from pySMART import DeviceList
 from stressmon.hwsensors import HWSensorBase
+
+log = logging.getLogger(__name__)
 
 
 class DriveTemp(HWSensorBase):
@@ -15,8 +18,14 @@ class DriveTemp(HWSensorBase):
 
     def __init__(self) -> None:
         self.iteration = 1
-        device_list = DeviceList()
-        self.drive_count = len(device_list.devices)
+        try:
+            device_list = DeviceList()
+        except Exception as e:  # pylint: disable=broad-except
+            # smartctl missing or not permitted: report no drives instead of
+            # raising out of the constructor and losing the sensor entirely.
+            log.warning("Drive discovery failed: %s", e)
+            device_list = None
+        self.drive_count = len(device_list.devices) if device_list else 0
         self.drives = {}
         self.lines = self.drive_count * 2
         if self.drive_count > 0:
@@ -46,26 +55,38 @@ class DriveTemp(HWSensorBase):
         """update NVMe temps
         """
         if self.drive_count > 0:
-            for device in DeviceList().devices:
-                temp = device.temperature
-                self.drives[device.name]['Composite'] = temp
-                minimum = min([self.mmm[device.name]['Composite'][0], temp])
-                maximum = max([self.mmm[device.name]['Composite'][1], temp])
-                mean = self.mmm[device.name]['Composite'][2]
-                mean = mean + (temp - mean) / self.iteration
-                self.mmm[device.name]['Composite'] = [minimum, maximum, mean]
-                for sensor in device.temperatures.keys():
-                    temp = device.temperatures[sensor]
-                    self.drives[device.name][f"Sensor {sensor}"] = temp
-                    minimum = min(
-                        [self.mmm[device.name][f"Sensor {sensor}"][0], temp])
-                    maximum = max(
-                        [self.mmm[device.name][f"Sensor {sensor}"][1], temp])
-                    mean = self.mmm[device.name][f"Sensor {sensor}"][2]
-                    mean = mean + (temp - mean) / self.iteration
-                    self.mmm[device.name][f"Sensor {sensor}"] = [
-                        minimum, maximum, mean]
+            try:
+                devices = DeviceList().devices
+            except Exception as e:  # pylint: disable=broad-except
+                # smartctl failing this round must not stop the sensor: the
+                # readings would silently go stale for the rest of the run.
+                log.warning("Drive temperature read failed: %s", e)
+                devices = []
+            for device in devices:
+                if device.name not in self.drives:
+                    # Drive appeared after startup (hot plug, or smartctl was
+                    # not ready at init).  The CSV headings are fixed at init,
+                    # so recording it now would shift every later column.
+                    continue
+                self._record(device.name, 'Composite', device.temperature)
+                for sensor in (device.temperatures or {}):
+                    self._record(device.name, f"Sensor {sensor}",
+                                 device.temperatures[sensor])
         self.iteration += 1
+
+    def _record(self, drive: str, sensor: str, temp) -> None:
+        """Store one reading, ignoring it when the drive reports nothing.
+
+        smartctl leaves the temperature empty on some NVMe drives and while a
+        drive is spinning up; that used to raise inside min()/max() and leave
+        this sensor frozen at whatever it had read last.
+        """
+        if temp is None or sensor not in self.mmm.get(drive, {}):
+            return
+        self.drives[drive][sensor] = temp
+        minimum, maximum, mean = self.mmm[drive][sensor]
+        self.mmm[drive][sensor] = [min(minimum, temp), max(maximum, temp),
+                                   mean + (temp - mean) / self.iteration]
 
     def get_label(self, params: list) -> str | None:
         """Get label for current sensor"""
@@ -146,14 +167,17 @@ class DriveTemp(HWSensorBase):
         """Return list of current NVMe temps
 
         Returns:
-            list: list of current NVMe clock speeds
+            list: list of current NVMe temps, one field per heading.  A sensor
+                  that reported nothing this round contributes an empty field,
+                  so the columns stay lined up with get_csv_headings().
         """
-        return [
-            round(value, 4)
-            for _, drive_info in self.drives.items()
-            for key, value in drive_info.items()
-            if key != 'Model' and value is not None
-        ]
+        data = []
+        for _, drive_info in self.drives.items():
+            for key, value in drive_info.items():
+                if key == 'Model':
+                    continue
+                data.append(round(value, 4) if value is not None else '')
+        return data
 
     def get_csv_headings(self) -> list:
         """Generate Headings list for CSV file of current values

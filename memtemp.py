@@ -36,6 +36,11 @@ class MemTemp(HWSensorBase):
         for i, entry in enumerate(spd):
             label = entry.label or f"DIMM {i}"
             temp = entry.current
+            if temp is None:
+                # The DIMM sensor answered nothing this round (busy, or still
+                # initialising).  min()/max() on None raised, which stopped
+                # this sensor for the rest of the run.
+                continue
             self.temps[label] = temp
             if label not in self.mmm:
                 self.mmm[label] = [temp, temp, temp]
@@ -60,7 +65,8 @@ class MemTemp(HWSensorBase):
     def get_current(self, params):
         if len(params) != 1:
             return None
-        return round(self.temps.get(params[0], 0))
+        temp = self.temps.get(params[0])
+        return round(temp) if temp is not None else None
 
     def get_min(self, params):
         if len(params) != 1:

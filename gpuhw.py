@@ -145,7 +145,7 @@ def drm_card_map():
 
 
 def intel_telemetry(card):
-    """Read i915 frequency/power data for an Intel iGPU (best effort)."""
+    """Read i915 frequency data for an Intel iGPU (best effort)."""
     out = {}
     if not card:
         return out
@@ -153,19 +153,32 @@ def intel_telemetry(card):
     for key, path in (("clock", "gt_cur_freq_mhz"),
                       ("clock_max", "gt_max_freq_mhz"),
                       ("clock_min", "gt_min_freq_mhz"),
-                      ("rc6_ms", "gt/gt0/rc6_residency_ms"),
-                      ("power_watts", "power/act_now")):
+                      ("clock_act", "gt/gt0/rps_act_freq_mhz"),
+                      ("rc6_ms", "gt/gt0/rc6_residency_ms")):
         raw = _read(card / path)
         if raw:
             try:
                 out[key] = float(raw)
             except ValueError:
                 pass
+    # No power reading: i915 exposes no per-GPU power node (the old
+    # "power/act_now" path is runtime-PM bookkeeping and never existed as a
+    # value), so the iGPU's power stays empty rather than silently missing.
     return out
 
 
 def _drm_driver(card):
-    return _read(card / "device" / "driver").rsplit("/", 1)[-1] if card else ""
+    """Driver bound to a DRM card, e.g. ``'i915'``.
+
+    ``card/device/driver`` is a symlink to the driver directory, so reading it
+    as a file yields nothing; the name has to come from the link target.
+    """
+    if not card:
+        return ""
+    try:
+        return os.readlink(os.path.join(str(card), "device", "driver")).rsplit("/", 1)[-1]
+    except OSError:
+        return ""
 
 
 def discover():

@@ -25,7 +25,14 @@ class CPUTemp(HWSensorBase):
         self.iteration = 1
         self.sensor = None
         self.temps = {}
-        sensors_temps = sensors_temperatures()
+        # Defined up front: with no coretemp/k10temp (a CPU psutil labels
+        # differently, or a module that failed to load) this stayed unset and
+        # update() raised AttributeError on the first pass.
+        self.mmm = {'min': {}, 'max': {}, 'mean': {}}
+        try:
+            sensors_temps = sensors_temperatures()
+        except (OSError, PermissionError):
+            sensors_temps = {}
         for sensor in self.sensors:
             if sensor in sensors_temps.keys():
                 self.sensor = sensor
@@ -84,12 +91,17 @@ class CPUTemp(HWSensorBase):
     def update(self) -> None:
         """update CPU temps
         """
-
-        sensors_temps = sensors_temperatures()
+        try:
+            sensors_temps = sensors_temperatures()
+        except (OSError, PermissionError):
+            self.iteration += 1
+            return
+        # The label can go away if its module is unloaded; KeyError used to
+        # stop every CPU temperature from updating for the rest of the run.
         cpu_num = 0
         cpu_sensor = ''
         cpu_core = ''
-        for temp_sensor in sensors_temps[self.sensor]:
+        for temp_sensor in sensors_temps.get(self.sensor, []):
             cpu_core = temp_sensor[0]
             if cpu_core == 'Tctl' or cpu_core == f"Package id {cpu_num}":
                 cpu_sensor = cpu_core
@@ -97,6 +109,13 @@ class CPUTemp(HWSensorBase):
                     cpu_sensor = f"Tctl{cpu_num}"
                     cpu_core = cpu_sensor
                 cpu_num += 1
+            if not cpu_sensor or cpu_core not in self.temps.get(cpu_sensor, {}):
+                # Unknown group or core: the CSV headings are fixed at init, so
+                # inventing a row here would shift every following column.
+                continue
+            if temp_sensor[1] is None:
+                # No reading this round; keep the previous value.
+                continue
             self.temps[cpu_sensor][cpu_core] = temp_sensor[1]
         for cpu in self.mmm['min']:
             for temp in self.mmm['min'][cpu]:
@@ -128,28 +147,32 @@ class CPUTemp(HWSensorBase):
         """
         if len(params) != 2:
             return None
-        return round(self.temps[params[0]][params[1]])
+        value = self.temps.get(params[0], {}).get(params[1])
+        return round(value) if value is not None else None
 
     def get_min(self, params: list) -> int | None:
         """get minimum cpu temperature for index
         """
         if len(params) != 2:
             return None
-        return round(self.mmm['min'][params[0]][params[1]])
+        value = self.mmm['min'].get(params[0], {}).get(params[1])
+        return round(value) if value is not None else None
 
     def get_max(self, params: list) -> int | None:
         """get maximum cpu temperature for index
         """
         if len(params) != 2:
             return None
-        return round(self.mmm['max'][params[0]][params[1]])
+        value = self.mmm['max'].get(params[0], {}).get(params[1])
+        return round(value) if value is not None else None
 
     def get_mean(self, params: list) -> int | None:
         """get mean cpu temperature for index rounded to nearest integer
         """
         if len(params) != 2:
             return None
-        return round(self.mmm['mean'][params[0]][params[1]])
+        value = self.mmm['mean'].get(params[0], {}).get(params[1])
+        return round(value) if value is not None else None
 
     def get_csv_data(self) -> list:
         """Return list of current cpu temps

@@ -10,6 +10,11 @@ class HWSensorBase(ABC):
 
     headings = []
 
+    # Value written back over a minimum when the accumulators are cleared.
+    # It is deliberately the same value the web UI uses so both reset paths
+    # leave a sensor's Min column displaying as empty rather than a number.
+    MIN_SENTINEL = 999999999
+
     @abstractmethod
     def get_label(self, params: list) -> str | None:
         """Get label"""
@@ -24,6 +29,46 @@ class HWSensorBase(ABC):
     def get_headings(self) -> list:
         """Get list of headings"""
         return self.headings
+
+    def reset_accumulators(self) -> None:
+        """Clear this sensor's min/max/mean history and restart the mean.
+
+        Handles every accumulator layout the sensors use:
+
+          {'min'|'max'|'mean': {label: value, ...}}        flat
+          {'min'|'max'|'mean': {group: {label: value}}}    nested
+          {entity: {metric: [min, max, mean], ...}}        per-leaf lists
+
+        Live readings are left alone; only the recorded history is dropped
+        and ``iteration`` (the mean's divisor) restarts at 1.
+        """
+        mmm = getattr(self, 'mmm', None)
+        if mmm is not None:
+            self._reset_mmm(mmm)
+        if hasattr(self, 'iteration'):
+            self.iteration = 1
+
+    @classmethod
+    def _reset_mmm(cls, node: dict, key: str = None) -> None:
+        """Walk an accumulator dict; ``key`` is 'min'/'max'/'mean' once known."""
+        if not isinstance(node, dict):
+            return
+        if key in ('min', 'max', 'mean'):
+            target = cls.MIN_SENTINEL if key == 'min' else 0
+            for sub_key, value in node.items():
+                if isinstance(value, dict):
+                    cls._reset_mmm(value, key)
+                elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                    node[sub_key] = target
+            return
+        for sub_key, value in node.items():
+            if (isinstance(value, list) and len(value) == 3
+                    and all(isinstance(v, (int, float)) for v in value)):
+                value[0] = cls.MIN_SENTINEL
+                value[1] = 0
+                value[2] = 0
+            elif isinstance(value, dict):
+                cls._reset_mmm(value, sub_key)
 
     @abstractmethod
     def get_section(self, params: list) -> str | None:

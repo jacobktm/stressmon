@@ -17,10 +17,9 @@ class CPUFreq(HWSensorBase):
         self.p_cores = None
         if self.cpuinfo.has_intel_pe_cores():
             self.p_cores = self.cpuinfo.get_p_cores()
-        if cpu_freq()[0] > 100:
-            self.multiplier = 1
-        else:
-            self.multiplier = 1000
+        # cpu_freq().current is None on some CPUs; the scale check must not
+        # raise out of the constructor.
+        self.multiplier = 1 if (cpu_freq()[0] or 0) > 100 else 1000
         self.cpucount = cpu_count(logical=True) + 1
         self.corecount = cpu_count(logical=True)
         self.labels = []
@@ -56,15 +55,29 @@ class CPUFreq(HWSensorBase):
 
     def update(self) -> None:
         """Update CPU frequency."""
-        main_cpu_freq = [cpu_freq()[0] * self.multiplier]
-        per_cpu_freqs = [(x[0] * self.multiplier)
+        main_cpu_freq = [(cpu_freq()[0] or 0) * self.multiplier]
+        per_cpu_freqs = [((x[0] or 0) * self.multiplier)
                          for x in cpu_freq(percpu=True)]
         p_core_freq = []
         e_core_freq = []
         if self.cpuinfo.has_intel_pe_cores():
-            p_core_freq = [sum(per_cpu_freqs[0:self.p_cores]) / self.p_cores]
-            e_core_freq = [sum(per_cpu_freqs[self.p_cores:]) / (self.corecount - self.p_cores)]
+            e_count = self.corecount - self.p_cores
+            if self.p_cores > 0 and e_count > 0 and len(per_cpu_freqs) == self.corecount:
+                p_core_freq = [sum(per_cpu_freqs[0:self.p_cores]) / self.p_cores]
+                e_core_freq = [sum(per_cpu_freqs[self.p_cores:]) / e_count]
+            else:
+                # A core left the per-CPU list (or the P/E split is unusable);
+                # dividing by a count that no longer matches would raise or
+                # average the wrong cores.
+                p_core_freq = [0]
+                e_core_freq = [0]
         mhz = main_cpu_freq + p_core_freq + e_core_freq + per_cpu_freqs
+        if len(mhz) != len(self.labels):
+            # A core appeared or dropped out since init: zipping this list
+            # against the labels would pair values with the wrong cores (and
+            # change the CSV width).  Keep last round's readings instead.
+            self.iteration += 1
+            return
         self.mhz = dict(zip(self.labels, mhz))
         lmin = [min(cur_min, ele)
                 for cur_min, ele in zip(self.mmm['min'].values(), mhz)]

@@ -44,6 +44,28 @@ def _nvml_driver_version():
         return None
 
 
+def _nvml(func, *args):
+    """Call an NVML getter, returning None instead of raising.
+
+    A query that fails for one adapter (GPU off the bus, transient driver
+    error under load) must not end the update pass for every GPU.
+    """
+    try:
+        return func(*args)
+    except NVMLError as e:
+        log.debug("%s failed: %s", getattr(func, "__name__", func), e)
+        return None
+
+
+def _amd(func):
+    """Call a pyamdgpuinfo query, returning None when it fails."""
+    try:
+        return func()
+    except Exception as e:  # pylint: disable=broad-except
+        log.debug("%s failed: %s", getattr(func, "__name__", func), e)
+        return None
+
+
 class GPUData(HWSensorBase):
     """Class to manage GPU Data.
 
@@ -397,19 +419,26 @@ class GPUData(HWSensorBase):
                         fan_speed = self._fallback_fan(
                             vendor, gpu_name, self.kind.get((vendor, gpu_name)))
 
-                    self.gpus[vendor][gpu_name]['temp'] = nvmlDeviceGetTemperature(
-                        handle,
-                        NVML_TEMPERATURE_GPU)
-                    self.gpus[vendor][gpu_name]['clock'] = nvmlDeviceGetClock(handle,
-                                                                              NVML_CLOCK_GRAPHICS,
-                                                                              NVML_CLOCK_ID_CURRENT)
+                    # Every NVML call can raise for one adapter (a GPU that
+                    # dropped off the bus, a transient driver error during a
+                    # stress run).  Losing the reading is far better than
+                    # losing the whole GPU sensor, which is what an unguarded
+                    # exception did: the readings went stale overnight.
+                    self.gpus[vendor][gpu_name]['temp'] = _nvml(
+                        nvmlDeviceGetTemperature, handle, NVML_TEMPERATURE_GPU)
+                    self.gpus[vendor][gpu_name]['clock'] = _nvml(
+                        nvmlDeviceGetClock, handle, NVML_CLOCK_GRAPHICS,
+                        NVML_CLOCK_ID_CURRENT)
                     self.gpus[vendor][gpu_name]['fan_speed'] = fan_speed
-                    self.gpus[vendor][gpu_name]['power'] = nvmlDeviceGetPowerUsage(
-                        handle) / 1000
-                    self.gpus[vendor][gpu_name]['memory'] = round(
-                        (nvmlDeviceGetMemoryInfo(handle).used / 1024 / 1024), 2)
-                    self.gpus[vendor][gpu_name]['utilization'] = nvmlDeviceGetUtilizationRates(
-                        handle).gpu
+                    power_mw = _nvml(nvmlDeviceGetPowerUsage, handle)
+                    self.gpus[vendor][gpu_name]['power'] = (
+                        power_mw / 1000 if power_mw is not None else None)
+                    mem = _nvml(nvmlDeviceGetMemoryInfo, handle)
+                    self.gpus[vendor][gpu_name]['memory'] = (
+                        round(mem.used / 1024 / 1024, 2) if mem else None)
+                    util = _nvml(nvmlDeviceGetUtilizationRates, handle)
+                    self.gpus[vendor][gpu_name]['utilization'] = (
+                        util.gpu if util else None)
 
                 elif vendor == 'amdgpu':
                     gpuinfo = self.gpuinfo_by_name.get(gpu_name)
@@ -431,21 +460,28 @@ class GPUData(HWSensorBase):
                         fan_speed = self._fallback_fan(
                             vendor, gpu_name, self.kind.get((vendor, gpu_name)))
 
-                    self.gpus[vendor][gpu_name]['temp'] = gpuinfo.query_temperature()
+                    self.gpus[vendor][gpu_name]['temp'] = _amd(gpuinfo.query_temperature)
                     self.gpus[vendor][gpu_name]['fan_speed'] = fan_speed
-                    self.gpus[vendor][gpu_name]['power'] = gpuinfo.query_power()
-                    self.gpus[vendor][gpu_name]['memory'] = round(
-                        (gpuinfo.query_vram_usage() / 1024 / 1024), 2)
-                    self.gpus[vendor][gpu_name]['utilization'] = gpuinfo.query_load(
-                    ) * 100
+                    # query_power() reports milliwatts while every other power
+                    # figure here (and the CSV "(Watts)" headings) is watts.
+                    power_mw = _amd(gpuinfo.query_power)
+                    self.gpus[vendor][gpu_name]['power'] = (
+                        power_mw / 1000 if power_mw is not None else None)
+                    vram_used = _amd(gpuinfo.query_vram_usage)
+                    self.gpus[vendor][gpu_name]['memory'] = (
+                        round(vram_used / 1024 / 1024, 2) if vram_used is not None else None)
+                    load = _amd(gpuinfo.query_load)
+                    self.gpus[vendor][gpu_name]['utilization'] = (
+                        load * 100 if load is not None else None)
 
                 elif vendor == 'intel':
                     card = self.intel_cards.get(gpu_name)
                     telemetry = gpuhw.intel_telemetry(card)
                     self.gpus[vendor][gpu_name]['clock'] = telemetry.get('clock')
-                    self.gpus[vendor][gpu_name]['power'] = telemetry.get('power_watts')
-                    # Intel iGPUs report no temperature, fan or VRAM data, and
-                    # the chassis fan that cools them is not a GPU fan.
+                    # i915 exposes no per-GPU power node at all (see
+                    # gpuhw.intel_telemetry), so power stays empty like the
+                    # temperature, fan and VRAM readings.
+                    self.gpus[vendor][gpu_name]['power'] = None
                     self.gpus[vendor][gpu_name]['temp'] = None
                     self.gpus[vendor][gpu_name]['fan_speed'] = None
                     self.gpus[vendor][gpu_name]['memory'] = None
@@ -497,7 +533,7 @@ class GPUData(HWSensorBase):
             str | None: driver version or None
         """
         if 'nvidia' in self.vendors:
-            return nvmlSystemGetDriverVersion()
+            return _nvml_driver_version()
         return None
 
     def get_current(self, params: list) -> int | None:
@@ -715,29 +751,31 @@ class GPUData(HWSensorBase):
         """get a list of current gpu data for csv log
 
         Returns:
-            list: list of current gpu data
+            list: list of current gpu data with exactly one field per heading.
+                  A metric with no reading this round contributes an empty
+                  field: the headings are written once, so skipping the empty
+                  readings made rows a different width from the header and
+                  from each other.
         """
         ret = []
         for vendor in self.vendors:
             for name in self.gpus[vendor]['names']:
                 for data in self.data:
-                    if self.gpus[vendor][name][data] is not None:
-                        ret.append(round(self.gpus[vendor][name][data], 4))
+                    value = self.gpus[vendor][name][data]
+                    ret.append(round(value, 4) if value is not None else '')
         return ret
 
     def get_csv_headings(self) -> list:
         """Get the CSV headings for GPU data
 
         Returns:
-            list: list of csv headings
+            list: list of csv headings, one per field get_csv_data() emits
         """
         headings = []
         for vendor in self.vendors:
             for name in self.gpus[vendor]['names']:
                 kind_label = KIND_LABELS.get(self.kind.get((vendor, name)), 'GPU')
                 for data in self.data:
-                    if self.gpus[vendor][name][data] is None:
-                        continue
                     heading = f"{vendor} GPU {name} ({kind_label}) {data}"
                     if data == 'fan_speed':
                         # The unit differs per adapter, so spell it out.

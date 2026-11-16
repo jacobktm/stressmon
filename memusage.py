@@ -2,7 +2,7 @@
 """
 
 from copy import deepcopy
-from subprocess import run, PIPE
+from subprocess import run, PIPE, CalledProcessError
 from psutil import virtual_memory, swap_memory
 from stressmon.hwsensors import HWSensorBase
 
@@ -26,13 +26,26 @@ class MemUsage(HWSensorBase):
         for mem in self.mmm['min']:
             for data in self.mmm['min'][mem]:
                 self.mmm['min'][mem][data] = 999999999999
+        self.mem_skus = self._read_mem_skus()
+
+    @staticmethod
+    def _read_mem_skus() -> list:
+        """DIMM part numbers, or an empty list when they can't be read.
+
+        dmidecode needs root; that used to raise here and take the whole
+        memory sensor with it, so the Current/Min/Max/Mean readings were lost
+        along with the SKUs.
+        """
         command = "dmidecode --type 17 | grep 'Part Number' | awk '{ print $3 }'"
-        result = run([command],
-                     shell=True,
-                     check=True,
-                     stdout=PIPE,
-                     stderr=PIPE).stdout.decode("utf-8").split("\n")
-        self.mem_skus = [x for x in result if x and x != 'Not' and x != 'Unknown']
+        try:
+            result = run([command],
+                         shell=True,
+                         check=True,
+                         stdout=PIPE,
+                         stderr=PIPE).stdout.decode("utf-8").split("\n")
+        except (OSError, CalledProcessError, UnicodeDecodeError):
+            return []
+        return [x for x in result if x and x != 'Not' and x != 'Unknown']
 
     def __iter__(self):
         # Create an iterator for the memory data

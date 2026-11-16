@@ -13,6 +13,13 @@ _SHORT_NAMES = {
     "uncore": "Uncore",
 }
 
+# RAPL spike filter.  A reading is suspect when it is more than _SPIKE_RATIO
+# times *and* more than _SPIKE_WATTS above the last accepted one; after
+# _SPIKE_ACCEPT_AFTER consecutive rejections the new level is taken as real.
+_SPIKE_RATIO = 4.0
+_SPIKE_WATTS = 25.0
+_SPIKE_ACCEPT_AFTER = 3
+
 
 def _domain_name(domain_index):
     """Read the RAPL domain name from sysfs, falling back to 'CPU<N>'."""
@@ -35,6 +42,7 @@ class CPUWatts(HWSensorBase):
         self.watts = {}
         self.file_time = {}
         self.cpu_joules = {}
+        self.rejections = {}
         self.mmm = {'min': {}, 'max': {}, 'mean': {}}
         self.iteration = 1
         self.labels = []
@@ -46,12 +54,20 @@ class CPUWatts(HWSensorBase):
                 continue
             raw = _domain_name(i)
             index = _SHORT_NAMES.get(raw, raw)
+            try:
+                with open(energy_uj, 'r', encoding='UTF-8') as joule_file:
+                    reading = joule_file.read().strip()
+                start_time = time_ns()
+                start_joules = int(reading)
+            except (OSError, ValueError):
+                # Unreadable (permissions) or mid-wrap: skip this domain rather
+                # than taking down the monitor at startup.
+                continue
             self.labels.append(index)
-            with open(energy_uj, 'r', encoding='UTF-8') as joule_file:
-                self.cpu_joules[index] = joule_file.read()
-                self.file_time[index] = time_ns()
-            self.cpu_joules[index] = int(self.cpu_joules[index])
+            self.cpu_joules[index] = start_joules
+            self.file_time[index] = start_time
             self.watts[index] = 0
+            self.rejections[index] = 0
             self.mmm['min'][index] = 9999
             self.mmm['max'][index] = 0
             self.mmm['mean'][index] = 0
@@ -65,6 +81,30 @@ class CPUWatts(HWSensorBase):
     def __next__(self) -> list:
         return [next(self._iter)]
 
+    def _plausible(self, index: str, watts: float) -> bool:
+        """Decide whether a RAPL reading is usable.
+
+        The energy counter wraps (negative deltas) and a read racing the wrap
+        yields an absurd number, so readings far from the last accepted one
+        are dropped.  The comparison used to be against the running mean, so
+        once that mean settled at an idle value any real load step sat above
+        2.5x it forever and the reported watts stayed frozen at the idle
+        figure for the rest of the run.
+        """
+        if watts <= 0:
+            return False
+        last = self.watts.get(index, 0)
+        if not last or watts <= max(last * _SPIKE_RATIO, last + _SPIKE_WATTS):
+            self.rejections[index] = 0
+            return True
+        self.rejections[index] = self.rejections.get(index, 0) + 1
+        if self.rejections[index] >= _SPIKE_ACCEPT_AFTER:
+            # Still reporting this level several rounds running: the machine
+            # really is drawing this much.
+            self.rejections[index] = 0
+            return True
+        return False
+
     def update(self):
         """Calculate CPU Watts
         """
@@ -73,14 +113,23 @@ class CPUWatts(HWSensorBase):
             start_time = self.file_time[index]
             i = self.labels.index(index)
             energy_uj = f"/sys/class/powercap/intel-rapl:{i}/energy_uj"
-            with open(energy_uj, 'r', encoding='UTF-8') as joule_file:
-                self.cpu_joules[index] = joule_file.read()
-                self.file_time[index] = time_ns()
-            self.cpu_joules[index] = int(self.cpu_joules[index])
-            joule_diff = self.cpu_joules[index] - start_joule
-            duration = self.file_time[index] - start_time
+            try:
+                with open(energy_uj, 'r', encoding='UTF-8') as joule_file:
+                    reading = joule_file.read()
+                now = time_ns()
+                current_joules = int(reading)
+            except (OSError, ValueError):
+                # Node gone, or a read caught mid-wrap; keep the window open so
+                # the next round's delta still covers this interval.
+                continue
+            joule_diff = current_joules - start_joule
+            duration = now - start_time
+            if duration <= 0:
+                continue
+            self.cpu_joules[index] = current_joules
+            self.file_time[index] = now
             watts = joule_diff / (duration / 1000)
-            if watts > 0 and (watts < (self.mmm['mean'][index] * 2.5) or self.mmm['mean'][index] == 0):
+            if self._plausible(index, watts):
                 self.watts[index] = watts
             self.mmm['min'][index] = min(
                 self.mmm['min'][index], self.watts[index])
