@@ -12,3 +12,4 @@ from stressmon.stressmon import StressMon
 from stressmon.cpuwatts import CPUWatts
 from stressmon.cpuusage import CPUUsage
 from stressmon.memusage import MemUsage
+from stressmon.memtemp import MemTemp
